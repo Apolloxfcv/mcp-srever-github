@@ -1,0 +1,49 @@
+# Railway deployment image.
+#
+# Identical build to the main Dockerfile, except the final stage uses a
+# minimal Debian base (instead of distroless) so it has a shell, and it runs
+# via docker-entrypoint.railway.sh, which maps Railway's dynamic $PORT onto
+# the server's --port flag and binds to 0.0.0.0. Railway terminates HTTPS at
+# its edge and proxies plain HTTP to the container, so the entrypoint also
+# passes --trust-proxy-headers so the server advertises https:// URLs (OAuth
+# metadata, etc.) based on the X-Forwarded-Proto/X-Forwarded-Host headers
+# Railway sets.
+FROM node:26-alpine@sha256:e88a35be04478413b7c71c455cd9865de9b9360e1f43456be5951032d7ac1a66 AS ui-build
+WORKDIR /app
+COPY ui/package*.json ./ui/
+RUN cd ui && npm ci
+COPY ui/ ./ui/
+RUN mkdir -p ./pkg/github/ui_dist && \
+    cd ui && npm run build
+
+FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
+ARG VERSION="dev"
+
+WORKDIR /build
+
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk add git
+
+COPY . .
+
+COPY --from=ui-build /app/pkg/github/ui_dist/* ./pkg/github/ui_dist/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION} -X main.commit=$(git rev-parse HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o /bin/github-mcp-server ./cmd/github-mcp-server
+
+FROM debian:bookworm-slim
+
+LABEL io.modelcontextprotocol.server.name="io.github.github/github-mcp-server"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /server
+COPY --from=build /bin/github-mcp-server .
+COPY docker-entrypoint.railway.sh /server/docker-entrypoint.sh
+RUN chmod +x /server/docker-entrypoint.sh
+
+ENTRYPOINT ["/server/docker-entrypoint.sh"]
